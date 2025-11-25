@@ -11,6 +11,7 @@
 import os
 import sys
 import traceback
+from contextlib import asynccontextmanager
 from functools import partial
 from copy import deepcopy
 from typing import AsyncGenerator, Generator, List, Tuple, Union
@@ -278,51 +279,60 @@ class NotebookRenderer(LoggingConfigurable):
         nb, _ = ClearOutputPreprocessor().preprocess(
             nb, {"metadata": {"path": self.cwd}}
         )
-        for cell_idx, input_cell in enumerate(nb.cells):
-            try:
-                output_cell = await self.executor.execute_cell(
-                    input_cell, None, cell_idx, store_history=False
-                )
-            except TimeoutError:
-                output_cell = input_cell
-                break
-            except CellExecutionError:
-                self.log.exception(
-                    "Error at server while executing cell: %r", input_cell
-                )
-                if self.executor.should_strip_error():
-                    strip_code_cell_warnings(input_cell)
-                    self.executor.strip_code_cell_errors(input_cell)
-                output_cell = input_cell
-                break
-            except Exception as e:
-                self.log.exception(
-                    "Error at server while executing cell: %r", input_cell
-                )
-                output_cell = nbformat.v4.new_code_cell()
-                if self.executor.should_strip_error():
-                    output_cell.outputs = [
-                        {
-                            "output_type": "stream",
-                            "name": "stderr",
-                            "text": "An exception occurred at the server (not the notebook). {}".format(
-                                self.executor.cell_error_instruction
-                            ),
-                        }
-                    ]
-                else:
-                    output_cell.outputs = [
-                        {
-                            "output_type": "error",
-                            "ename": type(e).__name__,
-                            "evalue": str(e),
-                            "traceback": traceback.format_exception(*sys.exc_info()),
-                        }
-                    ]
-            finally:
-                yield output_cell
+        
+        # Use context manager to ensure cleanup even if generator is abandoned
+        async with self._notebook_execution_context():
+            for cell_idx, input_cell in enumerate(nb.cells):
+                try:
+                    output_cell = await self.executor.execute_cell(
+                        input_cell, None, cell_idx, store_history=False
+                    )
+                except TimeoutError:
+                    output_cell = input_cell
+                    break
+                except CellExecutionError:
+                    self.log.exception(
+                        "Error at server while executing cell: %r", input_cell
+                    )
+                    if self.executor.should_strip_error():
+                        strip_code_cell_warnings(input_cell)
+                        self.executor.strip_code_cell_errors(input_cell)
+                    output_cell = input_cell
+                    break
+                except Exception as e:
+                    self.log.exception(
+                        "Error at server while executing cell: %r", input_cell
+                    )
+                    output_cell = nbformat.v4.new_code_cell()
+                    if self.executor.should_strip_error():
+                        output_cell.outputs = [
+                            {
+                                "output_type": "stream",
+                                "name": "stderr",
+                                "text": "An exception occurred at the server (not the notebook). {}".format(
+                                    self.executor.cell_error_instruction
+                                ),
+                            }
+                        ]
+                    else:
+                        output_cell.outputs = [
+                            {
+                                "output_type": "error",
+                                "ename": type(e).__name__,
+                                "evalue": str(e),
+                                "traceback": traceback.format_exception(*sys.exc_info()),
+                            }
+                        ]
+                finally:
+                    yield output_cell
 
-        await self._cleanup_resources()
+    @asynccontextmanager
+    async def _notebook_execution_context(self):
+        """Context manager to ensure cleanup of notebook execution resources"""
+        try:
+            yield
+        finally:
+            await self._cleanup_resources()
 
     async def _cleanup_resources(self):
         await ensure_async(self.executor.kc.stop_channels())

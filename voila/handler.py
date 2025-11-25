@@ -167,8 +167,16 @@ class VoilaHandler(BaseVoilaHandler):
                 yield "".join(rendered_cache)
 
             # Wait for current running cell finish and send this cell to
-            # frontend.
-            rendered, rendering = await render_task
+            # frontend. Add timeout to prevent indefinite blocking.
+            try:
+                rendered, rendering = await asyncio.wait_for(
+                    render_task,
+                    timeout=self.voila_configuration.http_keep_alive_timeout * 10
+                )
+            except asyncio.TimeoutError:
+                self.log.error("Timeout waiting for pre-heated kernel render task")
+                return
+                
             if len(rendered) > len(rendered_cache):
                 html_snippet = "".join(rendered[len(rendered_cache) :])
                 yield html_snippet
@@ -253,36 +261,53 @@ class VoilaHandler(BaseVoilaHandler):
             kernel_future = self.kernel_manager.get_kernel(kernel_id)
             queue = asyncio.Queue()
             if self.voila_configuration.progressive_rendering:
-                ExecutionRequestHandler._execution_data[kernel_id] = {
-                    "nb": gen.notebook,
-                    "config": self.traitlet_config,
-                    "show_tracebacks": self.voila_configuration.show_tracebacks,
-                }
+                async with ExecutionRequestHandler._execution_data_lock:
+                    ExecutionRequestHandler._execution_data[kernel_id] = {
+                        "nb": gen.notebook,
+                        "config": self.traitlet_config,
+                        "show_tracebacks": self.voila_configuration.show_tracebacks,
+                    }
 
             async def put_html():
-                async for html_snippet, _ in gen.generate_content_generator(
-                    kernel_id, kernel_future
-                ):
-                    await queue.put(html_snippet)
+                try:
+                    async for html_snippet, _ in gen.generate_content_generator(
+                        kernel_id, kernel_future
+                    ):
+                        await queue.put(html_snippet)
+                except Exception as e:
+                    self.log.exception("Error in content generator: %s", e)
+                finally:
+                    # Always send sentinel to prevent consumer deadlock
+                    await queue.put(None)
 
-                await queue.put(None)
-
-            asyncio.ensure_future(put_html())
+            put_html_task = asyncio.create_task(put_html())
 
             # If not done within the timeout, we send a heartbeat
             # this is fundamentally to avoid browser/proxy read-timeouts, but
             # can be used in a template to give feedback to a user
-            while True:
-                try:
-                    html_snippet = await asyncio.wait_for(
-                        queue.get(), self.voila_configuration.http_keep_alive_timeout
-                    )
-                except asyncio.TimeoutError:
-                    yield time_out()
-                else:
-                    if html_snippet is None:
+            try:
+                while True:
+                    # Check if task was cancelled
+                    if put_html_task.cancelled():
                         break
-                    yield html_snippet
+                    
+                    try:
+                        html_snippet = await asyncio.wait_for(
+                            queue.get(), self.voila_configuration.http_keep_alive_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        yield time_out()
+                    else:
+                        if html_snippet is None:
+                            break
+                        yield html_snippet
+            except asyncio.CancelledError:
+                put_html_task.cancel()
+                raise
+            finally:
+                # Ensure put_html task is cancelled if still running
+                if not put_html_task.done():
+                    put_html_task.cancel()
 
     def redirect_to_file(self, path):
         self.redirect(url_path_join(self.base_url, "voila", "files", path))
