@@ -28,9 +28,6 @@ if JUPYTER_SERVER_2:
 
         def initialize(self, **kwargs):
             super().initialize()
-            self.ping_interval = 120 * 1000  # 120 seconds
-            self.ping_timeout = 20 * 1000  # 20 seconds
-            self.max_message_size = 200 * 1024 * 1024  # 200 MB
 
         async def open(self, kernel_id: str) -> None:
             """Create a new websocket connection, this connection is
